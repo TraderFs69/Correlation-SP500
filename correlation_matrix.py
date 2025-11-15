@@ -256,6 +256,48 @@ df_logret = df_logret.dropna(how="all")
 if df_logret.empty:
     st.error("Impossible de calculer des log returns (beaucoup de NaN).")
     st.stop()
+    
+# === Paramètre utilisateur : nombre maximal de titres pour la matrice ===
+max_corr = st.number_input(
+    "Nombre maximal de titres pour la matrice de corrélation",
+    min_value=5,
+    max_value=100,
+    value=30,
+    step=5
+)
+
+# === Limitation de la liste utilisée pour la matrice ===
+corr_list = base_list[: int(max_corr)]
+
+st.info(f"Matrice basée sur {len(corr_list)} tickers : {', '.join(corr_list)}")
+
+# Téléchargement des données seulement pour les tickers de corrélation
+tickers_tuple = tuple(sorted(set(corr_list)))
+
+with st.spinner("Téléchargement des données pour corrélation…"):
+    bars, failed = download_bars_polygon_safe(tickers_tuple)
+
+# Construction dataframe des close
+close_prices = pd.DataFrame({
+    t: bars[t]["Close"] for t in corr_list 
+    if t in bars and bars[t] is not None and not bars[t].empty
+})
+
+# Nettoyage
+close_prices = close_prices.dropna()
+
+# Calcul returns
+returns = close_prices.pct_change().dropna()
+
+# Affichage matrice
+corr_mat = returns.corr()
+
+st.subheader("📊 Matrice de corrélation")
+st.dataframe(corr_mat, use_container_width=True)
+
+# Export CSV
+csv_corr = corr_mat.to_csv().encode("utf-8")
+st.download_button("💾 Télécharger la matrice (CSV)", data=csv_corr, file_name="correlation_matrix.csv")
 
 # ==============================
 # Matrice de corrélation
