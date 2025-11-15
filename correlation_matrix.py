@@ -15,10 +15,10 @@ import plotly.express as px
 # Config Streamlit
 # ==============================
 st.set_page_config(
-    page_title="Corrélation – Tickers manuels (Polygon)",
+    page_title="Corrélation – Tickers manuels ou secteurs (Polygon)",
     layout="wide"
 )
-st.title("📊 Matrice de corrélation – Tickers manuels (Polygon)")
+st.title("📊 Matrice de corrélation – Tickers manuels ou par secteur (Polygon)")
 
 # ==============================
 # Clé API Polygon
@@ -61,7 +61,7 @@ def polygon_aggs_daily(ticker: str, years: int) -> Optional[pd.DataFrame]:
     try:
         r = requests.get(url, params=params, timeout=30)
         if r.status_code != 200:
-            # On essaie d'extraire un message d'erreur lisible
+            # Essayer d'extraire un message lisible
             try:
                 js_err = r.json()
                 msg = js_err.get("error", js_err.get("message", str(js_err)))
@@ -128,6 +128,37 @@ def download_bars_polygon_safe(
     return out, failed
 
 # ==============================
+# S&P 500 – lecture depuis Excel
+# ==============================
+@st.cache_data(show_spinner=False, ttl=60*60)
+def get_sp500_constituents() -> pd.DataFrame:
+    """
+    Lit un fichier Excel local sp500_constituents.xlsx contenant au minimum une colonne 'Symbol'.
+    Colonnes recommandées : Symbol, Company, Sector.
+    """
+    path = "sp500_constituents.xlsx"
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Fichier {path} introuvable. Ajoute-le dans ton repo (même dossier que correlation_matrix.py)."
+        )
+
+    df = pd.read_excel(path)
+
+    if "Symbol" not in df.columns:
+        raise ValueError("Le fichier Excel doit contenir une colonne 'Symbol'.")
+
+    if "Company" not in df.columns:
+        df["Company"] = df["Symbol"]
+
+    if "Sector" not in df.columns:
+        df["Sector"] = "Unknown"
+
+    df["Symbol"] = df["Symbol"].astype(str).str.strip()
+    df = df[df["Symbol"] != ""]
+
+    return df
+
+# ==============================
 # Sidebar – paramètres utilisateur
 # ==============================
 st.sidebar.header("Paramètres")
@@ -143,8 +174,8 @@ years = st.sidebar.slider(
 max_tickers = st.sidebar.number_input(
     "Nombre max de tickers à utiliser",
     min_value=2,
-    max_value=50,
-    value=10,
+    max_value=100,
+    value=20,
     step=1,
 )
 
@@ -163,33 +194,75 @@ if debug_polygon and st.sidebar.button("Tester ce ticker maintenant"):
         st.sidebar.write(dft_test.tail())
 
 # ==============================
-# Saisie des tickers (manuelle)
+# Sélection des tickers – 2 modes
 # ==============================
 st.subheader("🧮 Sélection des tickers")
 
-default_text = "AMZN, AAPL, MSFT, GOOGL, IBM, NVDA"
-tickers_str = st.text_area(
-    "Liste de tickers (séparés par virgule, espace ou retour de ligne)",
-    value=default_text,
-    height=100,
+mode_sel = st.radio(
+    "Mode de sélection",
+    ["Tickers manuels", "Par secteur S&P 500"],
+    index=0,
+    horizontal=True
 )
 
-# Parsing des tickers
-raw_tokens = re.split(r"[,\s]+", tickers_str.upper())
-tickers_list = sorted(set([t.strip() for t in raw_tokens if t.strip() != ""]))
+tickers_list: List[str] = []
 
-if len(tickers_list) == 0:
-    st.warning("Entre au moins 2 tickers pour calculer une matrice de corrélation.")
-    st.stop()
+if mode_sel == "Tickers manuels":
+    default_text = "AMZN, AAPL, MSFT, GOOGL, IBM, NVDA"
+    tickers_str = st.text_area(
+        "Liste de tickers (séparés par virgule, espace ou retour de ligne)",
+        value=default_text,
+        height=100,
+    )
 
-if len(tickers_list) < 2:
-    st.warning(f"Tu as entré un seul ticker ({tickers_list[0]}). Il en faut au moins 2.")
-    st.stop()
+    # Parsing des tickers
+    raw_tokens = re.split(r"[,\s]+", tickers_str.upper())
+    tickers_list = sorted(set([t.strip() for t in raw_tokens if t.strip() != ""]))
 
-# Appliquer la limite max_tickers
+    if len(tickers_list) == 0:
+        st.warning("Entre au moins 2 tickers pour calculer une matrice de corrélation.")
+        st.stop()
+
+    if len(tickers_list) < 2:
+        st.warning(f"Tu as entré un seul ticker ({tickers_list[0]}). Il en faut au moins 2.")
+        st.stop()
+
+else:  # Par secteur S&P 500
+    try:
+        sp_df = get_sp500_constituents()
+    except Exception as e:
+        st.error(f"Erreur lors du chargement du S&P 500 : {e}")
+        st.stop()
+
+    sectors = sorted(sp_df["Sector"].dropna().unique().tolist())
+    if not sectors:
+        st.error("Aucun secteur disponible dans le fichier sp500_constituents.xlsx.")
+        st.stop()
+
+    sector_sel = st.selectbox("Choisis un secteur", sectors, index=0)
+
+    base = sp_df[sp_df["Sector"] == sector_sel].copy()
+    if base.empty:
+        st.error(f"Aucun ticker trouvé pour le secteur : {sector_sel}")
+        st.stop()
+
+    tickers_list = base["Symbol"].tolist()
+
+    # Limiter au nombre max_tickers
+    if len(tickers_list) > max_tickers:
+        tickers_list = tickers_list[:max_tickers]
+        st.info(
+            f"{len(base)} tickers disponibles dans le secteur **{sector_sel}** — "
+            f"limitation à **{max_tickers}** (modifiable dans la sidebar)."
+        )
+    else:
+        st.info(
+            f"{len(tickers_list)} tickers trouvés dans le secteur **{sector_sel}**."
+        )
+
 if len(tickers_list) > max_tickers:
-    tickers_list = tickers_list[: max_tickers]
-    st.info(f"Limitation à {max_tickers} tickers (tu peux changer la limite dans la sidebar).")
+    tickers_list = tickers_list[:max_tickers]
+    st.info(f"Limitation globale à {max_tickers} tickers (tu peux changer la limite dans la sidebar).")
 
 st.write(f"**Tickers utilisés ({len(tickers_list)}) :** {', '.join(tickers_list)}")
 
@@ -278,7 +351,7 @@ csv_corr = corr_mat.to_csv().encode("utf-8")
 st.download_button(
     "💾 Télécharger la matrice (CSV)",
     data=csv_corr,
-    file_name="correlation_matrix_manual_tickers.csv",
+    file_name="correlation_matrix_tickers.csv",
     mime="text/csv",
 )
 
@@ -286,7 +359,8 @@ st.markdown(
     f"""
 _Notes :_
 - Corrélation basée sur les **returns daily simples** sur ~{years} an(s).
-- Tu peux entrer n'importe quels tickers pris en charge par Polygon (ex.: `AMZN`, `AAPL`, `MSFT`, `GOOGL`, `NVDA`, `SPY`, etc.).
+- Mode **Tickers manuels** : tu peux entrer n'importe quels tickers supportés par Polygon.
+- Mode **Par secteur S&P 500** : utilise les tickers de ton fichier `sp500_constituents.xlsx`.
 - Limite actuelle dans la sidebar : **{max_tickers} tickers max**.
 """
 )
