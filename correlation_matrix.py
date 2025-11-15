@@ -4,6 +4,7 @@ import random
 import datetime as dt
 from typing import Dict, List, Tuple, Optional
 
+import re
 import requests
 import streamlit as st
 import pandas as pd
@@ -11,13 +12,13 @@ import numpy as np
 import plotly.express as px
 
 # ==============================
-# Config Streamlit (à faire en premier)
+# Config Streamlit
 # ==============================
 st.set_page_config(
-    page_title="Corrélation S&P 500 – Polygon",
+    page_title="Corrélation – Tickers manuels (Polygon)",
     layout="wide"
 )
-st.title("📊 Matrice de corrélation – S&P 500 (Polygon)")
+st.title("📊 Matrice de corrélation – Tickers manuels (Polygon)")
 
 # ==============================
 # Clé API Polygon
@@ -35,51 +36,15 @@ st.sidebar.caption(f"Polygon key loaded: {POLY[:4]}*** (len={len(POLY)})")
 # ==============================
 # Paramètres généraux
 # ==============================
-YEARS_DEFAULT = 3        # valeur par défaut (modifiable dans la sidebar)
-LIMIT_DAYS    = 50000    # large
-MAX_TICKERS_UI = 100     # MAX dans l'UI
-
-# ==============================
-# Lecture S&P 500 (Excel local)
-# ==============================
-@st.cache_data(show_spinner=False)
-def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Lit le fichier Excel local sp500_constituents.xlsx.
-    Doit contenir au moins une colonne 'Symbol'.
-    'Company' et 'Sector' sont optionnelles (créées si absentes).
-    """
-    path = "sp500_constituents.xlsx"
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Fichier {path} introuvable. Ajoute-le dans ton repo (même dossier que correlation_matrix.py)."
-        )
-
-    df = pd.read_excel(path)
-
-    if "Symbol" not in df.columns:
-        raise ValueError("Le fichier Excel doit contenir une colonne 'Symbol'.")
-
-    if "Company" not in df.columns:
-        df["Company"] = df["Symbol"]
-
-    if "Sector" not in df.columns:
-        df["Sector"] = "Unknown"
-
-    df["Symbol"] = df["Symbol"].astype(str).str.strip()
-    df = df[df["Symbol"] != ""]
-
-    tickers = df["Symbol"].tolist()
-    return df, tickers
+LIMIT_DAYS = 50000  # large
 
 # ==============================
 # Téléchargement Polygon – daily OHLCV
 # ==============================
 def polygon_aggs_daily(ticker: str, years: int) -> Optional[pd.DataFrame]:
     """
-    Récupère 'years' années de chandelles daily via Polygon.
-    Utilise /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+    Récupère 'years' années de chandelles daily via Polygon :
+    /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
     Retourne un DataFrame indexé par date, colonnes : Open, High, Low, Close, Volume.
     """
     end_date = dt.date.today()
@@ -102,7 +67,6 @@ def polygon_aggs_daily(ticker: str, years: int) -> Optional[pd.DataFrame]:
                 msg = js_err.get("error", js_err.get("message", str(js_err)))
             except Exception:
                 msg = r.text[:200]
-            # On loggue dans la sidebar en mode debug
             if st.session_state.get("debug_polygon", False):
                 st.sidebar.error(f"Polygon KO pour {ticker}: HTTP {r.status_code} – {msg}")
             return None
@@ -139,6 +103,7 @@ def polygon_aggs_daily(ticker: str, years: int) -> Optional[pd.DataFrame]:
             st.sidebar.error(f"Exception Polygon pour {ticker}: {e}")
         return None
 
+
 @st.cache_data(show_spinner=False)
 def download_bars_polygon_safe(
     tickers: Tuple[str, ...],
@@ -146,7 +111,7 @@ def download_bars_polygon_safe(
 ) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
     Télécharge les données daily pour chaque ticker via Polygon.
-    Retourne (bars_dict, failed_tickers)
+    Retourne (bars_dict, failed_tickers).
     """
     out: Dict[str, pd.DataFrame] = {}
     failed: List[str] = []
@@ -171,31 +136,17 @@ years = st.sidebar.slider(
     "Nombre d'années d'historique",
     min_value=1,
     max_value=5,
-    value=YEARS_DEFAULT,
+    value=3,
     step=1,
 )
 
 max_tickers = st.sidebar.number_input(
-    "Nombre max de tickers pour la matrice",
-    min_value=5,
-    max_value=MAX_TICKERS_UI,
-    value=30,
-    step=5,
+    "Nombre max de tickers à utiliser",
+    min_value=2,
+    max_value=50,
+    value=10,
+    step=1,
 )
-
-st.sidebar.markdown("---")
-st.sidebar.header("Filtre S&P 500")
-
-# Chargement S&P 500
-with st.spinner("Chargement de la liste S&P 500…"):
-    try:
-        sp_df, all_tickers = get_sp500_constituents()
-    except Exception as e:
-        st.error(f"Erreur lors du chargement du S&P 500 : {e}")
-        st.stop()
-
-sectors = sorted(sp_df["Sector"].dropna().unique().tolist())
-sector_sel = st.sidebar.multiselect("Secteurs", sectors, [])
 
 st.sidebar.markdown("---")
 st.sidebar.header("Debug Polygon")
@@ -212,28 +163,35 @@ if debug_polygon and st.sidebar.button("Tester ce ticker maintenant"):
         st.sidebar.write(dft_test.tail())
 
 # ==============================
-# Filtrage des tickers
+# Saisie des tickers (manuelle)
 # ==============================
-if sector_sel:
-    base = sp_df[sp_df["Sector"].isin(sector_sel)].copy()
-else:
-    base = sp_df.copy()
+st.subheader("🧮 Sélection des tickers")
 
-base_list = base["Symbol"].tolist()
-total_avail = len(base_list)
-
-if total_avail == 0:
-    st.warning("Aucun ticker disponible avec ces filtres (secteur).")
-    st.stop()
-
-# On applique la limite max_tickers
-base_list = base_list[: int(max_tickers)]
-st.caption(
-    f"Tickers filtrés : {len(base_list)} (sur {total_avail} disponibles avec ce filtre)."
+default_text = "AMZN, AAPL, MSFT, GOOGL, IBM, NVDA"
+tickers_str = st.text_area(
+    "Liste de tickers (séparés par virgule, espace ou retour de ligne)",
+    value=default_text,
+    height=100,
 )
 
-st.write("**Tickers utilisés pour la matrice :**")
-st.write(", ".join(base_list))
+# Parsing des tickers
+raw_tokens = re.split(r"[,\s]+", tickers_str.upper())
+tickers_list = sorted(set([t.strip() for t in raw_tokens if t.strip() != ""]))
+
+if len(tickers_list) == 0:
+    st.warning("Entre au moins 2 tickers pour calculer une matrice de corrélation.")
+    st.stop()
+
+if len(tickers_list) < 2:
+    st.warning(f"Tu as entré un seul ticker ({tickers_list[0]}). Il en faut au moins 2.")
+    st.stop()
+
+# Appliquer la limite max_tickers
+if len(tickers_list) > max_tickers:
+    tickers_list = tickers_list[: max_tickers]
+    st.info(f"Limitation à {max_tickers} tickers (tu peux changer la limite dans la sidebar).")
+
+st.write(f"**Tickers utilisés ({len(tickers_list)}) :** {', '.join(tickers_list)}")
 
 # ==============================
 # Bouton d'exécution
@@ -245,7 +203,7 @@ if not go:
 # ==============================
 # Téléchargement des données
 # ==============================
-tickers_tuple = tuple(sorted(set(base_list)))
+tickers_tuple = tuple(tickers_list)
 
 with st.spinner("Téléchargement des chandelles daily (Polygon)…"):
     bars, failed = download_bars_polygon_safe(tickers_tuple, years=years)
@@ -266,14 +224,14 @@ if valid < 2:
 # ==============================
 # Construction des returns & corrélation
 # ==============================
-# On construit un DataFrame des Close alignés par date
+# DataFrame des Close alignés par date
 close_prices = pd.DataFrame({
     t: bars[t]["Close"]
-    for t in base_list
+    for t in tickers_list
     if t in bars and "Close" in bars[t].columns and not bars[t].empty
 })
 
-# On enlève les dates où il manque des valeurs
+# On enlève les dates avec des NaN
 close_prices = close_prices.dropna(how="any")
 
 if close_prices.shape[1] < 2:
@@ -320,7 +278,7 @@ csv_corr = corr_mat.to_csv().encode("utf-8")
 st.download_button(
     "💾 Télécharger la matrice (CSV)",
     data=csv_corr,
-    file_name="correlation_matrix_sp500.csv",
+    file_name="correlation_matrix_manual_tickers.csv",
     mime="text/csv",
 )
 
@@ -328,7 +286,7 @@ st.markdown(
     f"""
 _Notes :_
 - Corrélation basée sur les **returns daily simples** sur ~{years} an(s).
-- Maximum de **{MAX_TICKERS_UI} tickers** sélectionnables dans l'interface (actuellement : {len(base_list)}).
-- Tu peux changer les secteurs, le nombre d'années et le nombre max de tickers dans la sidebar.
+- Tu peux entrer n'importe quels tickers pris en charge par Polygon (ex.: `AMZN`, `AAPL`, `MSFT`, `GOOGL`, `NVDA`, `SPY`, etc.).
+- Limite actuelle dans la sidebar : **{max_tickers} tickers max**.
 """
 )
