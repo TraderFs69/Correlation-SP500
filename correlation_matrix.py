@@ -183,7 +183,7 @@ sector_sel = st.sidebar.selectbox(
 max_tickers = st.sidebar.slider(
     "Nombre maximal de tickers dans le secteur",
     min_value=5,
-    max_value=40,
+    max_value=100,
     value=20,
     step=1
 )
