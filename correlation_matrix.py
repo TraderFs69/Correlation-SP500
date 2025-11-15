@@ -1,24 +1,23 @@
-# correlation_matrix.py
 import os
 import time
 import random
 import datetime as dt
 from typing import Dict, List, Tuple, Optional
 
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
 import plotly.express as px
 
 # ==============================
-# Config Streamlit (doit être le 1er st.*)
+# Config Streamlit (à faire en premier)
 # ==============================
 st.set_page_config(
-    page_title="Corrélation sectorielle – S&P 500 (Polygon)",
+    page_title="Corrélation S&P 500 – Polygon",
     layout="wide"
 )
-st.title("📊 Matrice de corrélation par secteur – S&P 500 (Polygon)")
+st.title("📊 Matrice de corrélation – S&P 500 (Polygon)")
 
 # ==============================
 # Clé API Polygon
@@ -31,7 +30,14 @@ if not POLY:
     st.error("⚠️ POLYGON_API_KEY manquant. Ajoute-le dans `.env` ou dans les Secrets Streamlit.")
     st.stop()
 
-st.sidebar.caption(f"Polygon key: {POLY[:4]}*** (len={len(POLY)})")
+st.sidebar.caption(f"Polygon key loaded: {POLY[:4]}*** (len={len(POLY)})")
+
+# ==============================
+# Paramètres généraux
+# ==============================
+YEARS_DEFAULT = 3        # valeur par défaut (modifiable dans la sidebar)
+LIMIT_DAYS    = 50000    # large
+MAX_TICKERS_UI = 100     # MAX dans l'UI
 
 # ==============================
 # Lecture S&P 500 (Excel local)
@@ -39,14 +45,15 @@ st.sidebar.caption(f"Polygon key: {POLY[:4]}*** (len={len(POLY)})")
 @st.cache_data(show_spinner=False)
 def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
     """
-    Lit le fichier Excel sp500_constituents.xlsx (même dossier que ce script).
-    Doit contenir au minimum une colonne 'Symbol'.
+    Lit le fichier Excel local sp500_constituents.xlsx.
+    Doit contenir au moins une colonne 'Symbol'.
+    'Company' et 'Sector' sont optionnelles (créées si absentes).
     """
     path = "sp500_constituents.xlsx"
+
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} introuvable. Assure-toi qu'il est présent dans le repo, "
-            "au même niveau que correlation_matrix.py."
+            f"Fichier {path} introuvable. Ajoute-le dans ton repo (même dossier que correlation_matrix.py)."
         )
 
     df = pd.read_excel(path)
@@ -54,9 +61,9 @@ def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
     if "Symbol" not in df.columns:
         raise ValueError("Le fichier Excel doit contenir une colonne 'Symbol'.")
 
-    # Colonnes minimales
     if "Company" not in df.columns:
         df["Company"] = df["Symbol"]
+
     if "Sector" not in df.columns:
         df["Sector"] = "Unknown"
 
@@ -66,297 +73,262 @@ def get_sp500_constituents() -> Tuple[pd.DataFrame, List[str]]:
     tickers = df["Symbol"].tolist()
     return df, tickers
 
-
 # ==============================
-# Polygon – téléchargement OHLC daily
+# Téléchargement Polygon – daily OHLCV
 # ==============================
-def _polygon_daily_close(
-    ticker: str,
-    years: int
-) -> Optional[pd.Series]:
+def polygon_aggs_daily(ticker: str, years: int) -> Optional[pd.DataFrame]:
     """
-    Récupère {years} ans de daily via Polygon et renvoie une Series des 'Close'.
-    Pas de Heikin, juste la clôture normale.
+    Récupère 'years' années de chandelles daily via Polygon.
+    Utilise /v2/aggs/ticker/{ticker}/range/1/day/{from}/{to}
+    Retourne un DataFrame indexé par date, colonnes : Open, High, Low, Close, Volume.
     """
     end_date = dt.date.today()
     start_date = end_date - dt.timedelta(days=int(years * 365.25))
 
     url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
-
     params = {
         "adjusted": "true",
         "sort": "asc",
-        "limit": 50000,
+        "limit": LIMIT_DAYS,
         "apiKey": POLY,
     }
 
-    retry_delays = [0.4, 0.8, 1.6, 3.2]
-    last_error = None
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code != 200:
+            # On essaie d'extraire un message d'erreur lisible
+            try:
+                js_err = r.json()
+                msg = js_err.get("error", js_err.get("message", str(js_err)))
+            except Exception:
+                msg = r.text[:200]
+            # On loggue dans la sidebar en mode debug
+            if st.session_state.get("debug_polygon", False):
+                st.sidebar.error(f"Polygon KO pour {ticker}: HTTP {r.status_code} – {msg}")
+            return None
 
-    for delay in retry_delays:
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code != 200:
-                try:
-                    js_err = r.json()
-                    msg = js_err.get("error", js_err.get("message", str(js_err)))
-                except Exception:
-                    msg = r.text[:200]
-                last_error = f"HTTP {r.status_code} – {msg}"
-                time.sleep(delay)
-                continue
+        js = r.json()
+        results = js.get("results", [])
+        if not results:
+            if st.session_state.get("debug_polygon", False):
+                st.sidebar.warning(f"Polygon: aucun 'results' pour {ticker}.")
+            return None
 
-            js = r.json()
-            results = js.get("results", [])
-            if not results:
-                last_error = "Empty results"
-                time.sleep(delay)
-                continue
+        df = pd.DataFrame(results)
+        rename_map = {
+            "o": "Open",
+            "h": "High",
+            "l": "Low",
+            "c": "Close",
+            "v": "Volume",
+            "t": "ts",
+        }
+        df = df.rename(columns=rename_map)
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_localize(None)
+        df = df.set_index("ts").sort_index()
 
-            df = pd.DataFrame(results)
-            if "c" not in df.columns or "t" not in df.columns:
-                last_error = "Colonnes 'c' ou 't' absentes"
-                time.sleep(delay)
-                continue
+        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        if not keep:
+            return None
 
-            df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True).dt.tz_localize(None)
-            df = df.set_index("ts").sort_index()
-            close = df["c"].astype(float)
-            close.name = ticker
-            return close
+        out = df[keep].astype(float)
+        return out
 
-        except Exception as e:
-            last_error = f"Exception: {e}"
-            time.sleep(delay)
+    except Exception as e:
+        if st.session_state.get("debug_polygon", False):
+            st.sidebar.error(f"Exception Polygon pour {ticker}: {e}")
+        return None
 
-    # Debug discret dans la sidebar (optionnel)
-    st.sidebar.warning(f"Polygon KO pour {ticker}: {last_error}")
-    return None
-
-
-@st.cache_data(show_spinner=True)
-def download_sector_prices(
+@st.cache_data(show_spinner=False)
+def download_bars_polygon_safe(
     tickers: Tuple[str, ...],
     years: int
-) -> pd.DataFrame:
+) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
     """
-    Télécharge les clôtures daily pour une liste de tickers (tuple) sur 'years' années.
-    Renvoie un DataFrame indexé par date, colonnes = tickers disponibles.
+    Télécharge les données daily pour chaque ticker via Polygon.
+    Retourne (bars_dict, failed_tickers)
     """
-    closes: Dict[str, pd.Series] = {}
+    out: Dict[str, pd.DataFrame] = {}
+    failed: List[str] = []
+
     for t in tickers:
-        serie = _polygon_daily_close(t, years)
-        if serie is not None and len(serie) > 30:
-            closes[t] = serie
-        # petite pause anti-throttle
-        time.sleep(0.3 + random.random() * 0.3)
+        dft = polygon_aggs_daily(t, years=years)
+        if dft is not None and not dft.empty:
+            out[t] = dft
+        else:
+            failed.append(t)
+        # petite pause pour éviter de spam l'API
+        time.sleep(0.25 + random.random() * 0.25)
 
-    if not closes:
-        return pd.DataFrame()
-
-    # Alignement sur l'index commun (dates)
-    df_prices = pd.DataFrame(closes)
-    # On enlève les dates où tout est NaN
-    df_prices = df_prices.dropna(how="all")
-    return df_prices
-
+    return out, failed
 
 # ==============================
-# UI – Contrôles
+# Sidebar – paramètres utilisateur
 # ==============================
-with st.spinner("Chargement des constituants du S&P 500…"):
-    sp_df, all_tickers = get_sp500_constituents()
-
-if "Sector" not in sp_df.columns:
-    st.error("La colonne 'Sector' est absente du fichier S&P 500. Impossible de filtrer par secteur.")
-    st.stop()
-
-sectors = sorted(sp_df["Sector"].dropna().unique().tolist())
-st.sidebar.header("Paramètres de la matrice de corrélation")
-
-sector_sel = st.sidebar.selectbox(
-    "Secteur",
-    sectors,
-    index=sectors.index("Information Technology") if "Information Technology" in sectors else 0
-)
-
-max_tickers = st.sidebar.slider(
-    "Nombre maximal de tickers dans le secteur",
-    min_value=5,
-    max_value=100,
-    value=20,
-    step=1
-)
+st.sidebar.header("Paramètres")
 
 years = st.sidebar.slider(
     "Nombre d'années d'historique",
     min_value=1,
     max_value=5,
-    value=2,
-    step=1
+    value=YEARS_DEFAULT,
+    step=1,
 )
 
-min_common_days = st.sidebar.slider(
-    "Nb minimum de jours communs (pour corrélation)",
-    min_value=30,
-    max_value=300,
-    value=100,
-    step=10
+max_tickers = st.sidebar.number_input(
+    "Nombre max de tickers pour la matrice",
+    min_value=5,
+    max_value=MAX_TICKERS_UI,
+    value=30,
+    step=5,
 )
 
-st.write(
-    f"Secteur sélectionné : **{sector_sel}** — "
-    f"{years} an(s) d'historique — max **{max_tickers}** tickers"
-)
+st.sidebar.markdown("---")
+st.sidebar.header("Filtre S&P 500")
 
-# Filtrage des tickers par secteur
-sector_df = sp_df[sp_df["Sector"] == sector_sel].copy()
-if sector_df.empty:
-    st.error("Aucun ticker trouvé pour ce secteur.")
+# Chargement S&P 500
+with st.spinner("Chargement de la liste S&P 500…"):
+    try:
+        sp_df, all_tickers = get_sp500_constituents()
+    except Exception as e:
+        st.error(f"Erreur lors du chargement du S&P 500 : {e}")
+        st.stop()
+
+sectors = sorted(sp_df["Sector"].dropna().unique().tolist())
+sector_sel = st.sidebar.multiselect("Secteurs", sectors, [])
+
+st.sidebar.markdown("---")
+st.sidebar.header("Debug Polygon")
+debug_polygon = st.sidebar.checkbox("Activer le debug Polygon", value=False)
+st.session_state["debug_polygon"] = debug_polygon
+test_symbol = st.sidebar.text_input("Ticker test (Polygon)", "AAPL")
+
+if debug_polygon and st.sidebar.button("Tester ce ticker maintenant"):
+    dft_test = polygon_aggs_daily(test_symbol.upper(), years=years)
+    if dft_test is None or dft_test.empty:
+        st.sidebar.error(f"❌ Polygon n'a renvoyé AUCUNE donnée pour {test_symbol.upper()}.")
+    else:
+        st.sidebar.success(f"✅ Polygon OK pour {test_symbol.upper()} – {len(dft_test)} barres daily.")
+        st.sidebar.write(dft_test.tail())
+
+# ==============================
+# Filtrage des tickers
+# ==============================
+if sector_sel:
+    base = sp_df[sp_df["Sector"].isin(sector_sel)].copy()
+else:
+    base = sp_df.copy()
+
+base_list = base["Symbol"].tolist()
+total_avail = len(base_list)
+
+if total_avail == 0:
+    st.warning("Aucun ticker disponible avec ces filtres (secteur).")
     st.stop()
 
-sector_df = sector_df.sort_values("Symbol")
-tickers_list = sector_df["Symbol"].head(max_tickers).tolist()
+# On applique la limite max_tickers
+base_list = base_list[: int(max_tickers)]
+st.caption(
+    f"Tickers filtrés : {len(base_list)} (sur {total_avail} disponibles avec ce filtre)."
+)
 
-st.write(f"Tickers retenus ({len(tickers_list)}) : {', '.join(tickers_list)}")
+st.write("**Tickers utilisés pour la matrice :**")
+st.write(", ".join(base_list))
 
+# ==============================
+# Bouton d'exécution
+# ==============================
 go = st.button("▶️ Construire la matrice de corrélation")
 if not go:
     st.stop()
 
 # ==============================
-# Téléchargement des prix & log returns
+# Téléchargement des données
 # ==============================
-with st.spinner("Téléchargement des prix daily via Polygon…"):
-    df_prices = download_sector_prices(tuple(tickers_list), years)
+tickers_tuple = tuple(sorted(set(base_list)))
 
-if df_prices.empty:
-    st.error("Aucune série de prix utilisable n'a été récupérée. Vérifie la clé Polygon ou réessaie.")
+with st.spinner("Téléchargement des chandelles daily (Polygon)…"):
+    bars, failed = download_bars_polygon_safe(tickers_tuple, years=years)
+
+valid = sum(1 for t in tickers_tuple if t in bars and bars[t] is not None and not bars[t].empty)
+st.caption(f"✅ Jeux de données valides : {valid}/{len(tickers_tuple)}")
+
+if failed:
+    st.warning(
+        f"⚠️ Tickers échoués: {len(failed)} — ex.: {', '.join(failed[:8])}"
+        + ("…" if len(failed) > 8 else "")
+    )
+
+if valid < 2:
+    st.error("Pas assez de tickers valides pour calculer une matrice de corrélation.")
     st.stop()
 
-st.write(f"Dimensions des prix bruts: {df_prices.shape[0]} jours x {df_prices.shape[1]} tickers")
-
-# On ne garde que les colonnes avec suffisamment de données
-valid_cols = [
-    c for c in df_prices.columns
-    if df_prices[c].count() >= min_common_days
-]
-df_prices = df_prices[valid_cols]
-
-if df_prices.shape[1] < 2:
-    st.error("Pas assez de tickers avec suffisamment de données pour calculer une corrélation.")
-    st.stop()
-
-st.write(f"Tickers avec au moins {min_common_days} jours de données: {df_prices.shape[1]}")
-
-# Log returns
-df_logret = np.log(df_prices / df_prices.shift(1))
-df_logret = df_logret.dropna(how="all")
-
-if df_logret.empty:
-    st.error("Impossible de calculer des log returns (beaucoup de NaN).")
-    st.stop()
-    
-# === Paramètre utilisateur : nombre maximal de titres pour la matrice ===
-max_corr = st.number_input(
-    "Nombre maximal de titres pour la matrice de corrélation",
-    min_value=5,
-    max_value=100,
-    value=30,
-    step=5
-)
-
-# === Limitation de la liste utilisée pour la matrice ===
-corr_list = base_list[: int(max_corr)]
-
-st.info(f"Matrice basée sur {len(corr_list)} tickers : {', '.join(corr_list)}")
-
-# Téléchargement des données seulement pour les tickers de corrélation
-tickers_tuple = tuple(sorted(set(corr_list)))
-
-with st.spinner("Téléchargement des données pour corrélation…"):
-    bars, failed = download_bars_polygon_safe(tickers_tuple)
-
-# Construction dataframe des close
+# ==============================
+# Construction des returns & corrélation
+# ==============================
+# On construit un DataFrame des Close alignés par date
 close_prices = pd.DataFrame({
-    t: bars[t]["Close"] for t in corr_list 
-    if t in bars and bars[t] is not None and not bars[t].empty
+    t: bars[t]["Close"]
+    for t in base_list
+    if t in bars and "Close" in bars[t].columns and not bars[t].empty
 })
 
-# Nettoyage
-close_prices = close_prices.dropna()
+# On enlève les dates où il manque des valeurs
+close_prices = close_prices.dropna(how="any")
 
-# Calcul returns
-returns = close_prices.pct_change().dropna()
+if close_prices.shape[1] < 2:
+    st.error("Moins de deux séries complètes après alignement des dates.")
+    st.stop()
 
-# Affichage matrice
+# Returns simples (pas log return)
+returns = close_prices.pct_change().dropna(how="any")
+
+if returns.empty:
+    st.error("Impossible de calculer les returns (data vide après pct_change).")
+    st.stop()
+
 corr_mat = returns.corr()
 
-st.subheader("📊 Matrice de corrélation")
+# ==============================
+# Affichage – Table + Heatmap
+# ==============================
+st.subheader("📊 Matrice de corrélation des returns (daily)")
+
 st.dataframe(corr_mat, use_container_width=True)
 
-# Export CSV
-csv_corr = corr_mat.to_csv().encode("utf-8")
-st.download_button("💾 Télécharger la matrice (CSV)", data=csv_corr, file_name="correlation_matrix.csv")
-
-# ==============================
-# Matrice de corrélation
-# ==============================
-corr = df_logret.corr()
-
-st.subheader("🔗 Matrice de corrélation (log returns)")
-st.caption("Corrélation de Pearson sur les log returns journaliers.")
-
 fig = px.imshow(
-    corr,
-    text_auto=".2f",
-    aspect="auto",
-    title=f"Corrélation – {sector_sel}",
+    corr_mat,
+    text_auto=False,
+    color_continuous_scale="RdBu",
     zmin=-1,
     zmax=1,
-    color_continuous_scale="RdBu"
+    aspect="auto",
+)
+fig.update_layout(
+    width=None,
+    height=700,
+    xaxis_title="Ticker",
+    yaxis_title="Ticker",
+    coloraxis_colorbar=dict(title="Corr")
 )
 st.plotly_chart(fig, use_container_width=True)
 
-st.dataframe(corr, use_container_width=True)
-
 # ==============================
-# Paires les plus corrélées / décorrélées
-# ==============================
-pairs = []
-cols = corr.columns.tolist()
-n = len(cols)
-
-for i in range(n):
-    for j in range(i + 1, n):
-        pairs.append({
-            "Ticker 1": cols[i],
-            "Ticker 2": cols[j],
-            "Corr": corr.iloc[i, j]
-        })
-
-pairs_df = pd.DataFrame(pairs)
-pairs_df["|Corr|"] = pairs_df["Corr"].abs()
-
-top_n = min(25, len(pairs_df))
-
-st.subheader(f"🔥 Top {top_n} paires les plus corrélées (en valeur absolue)")
-st.dataframe(
-    pairs_df.sort_values("|Corr|", ascending=False).head(top_n),
-    use_container_width=True
-)
-
-st.subheader(f"❄️ Top {top_n} paires les plus DÉcorrélées (proches de 0)")
-st.dataframe(
-    pairs_df.sort_values("|Corr|", ascending=True).head(top_n),
-    use_container_width=True
-)
-
 # Export CSV
-csv_corr = corr.to_csv().encode("utf-8")
+# ==============================
+csv_corr = corr_mat.to_csv().encode("utf-8")
 st.download_button(
-    "💾 Télécharger la matrice de corrélation (CSV)",
+    "💾 Télécharger la matrice (CSV)",
     data=csv_corr,
-    file_name=f"correlation_matrix_{sector_sel.replace(' ', '_')}.csv",
-    mime="text/csv"
+    file_name="correlation_matrix_sp500.csv",
+    mime="text/csv",
+)
+
+st.markdown(
+    f"""
+_Notes :_
+- Corrélation basée sur les **returns daily simples** sur ~{years} an(s).
+- Maximum de **{MAX_TICKERS_UI} tickers** sélectionnables dans l'interface (actuellement : {len(base_list)}).
+- Tu peux changer les secteurs, le nombre d'années et le nombre max de tickers dans la sidebar.
+"""
 )
